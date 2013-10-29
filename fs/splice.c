@@ -32,6 +32,10 @@
 #include <linux/gfp.h>
 #include <linux/socket.h>
 #include <linux/compat.h>
+#include <linux/page-flags.h>
+#include <linux/hugetlb.h>
+#include <linux/ksm.h>
+#include <linux/swapops.h>
 #include "internal.h"
 
 /*
@@ -1562,6 +1566,65 @@ static int pipe_to_user(struct pipe_inode_info *pipe, struct pipe_buffer *buf,
 	char *src;
 	int ret;
 
+        if (!buf->offset && (buf->len == PAGE_SIZE) &&
+            (buf->flags & PIPE_BUF_FLAG_GIFT) && (sd->flags & SPLICE_F_MOVE)) {
+                struct page *page = buf->page;
+                struct mm_struct *mm;
+                struct vm_area_struct *vma;
+                spinlock_t *ptl;
+                pte_t *ptep, pte;
+                unsigned long useraddr;
+
+                if (!PageAnon(page))
+                        goto copy;
+                if (PageCompound(page))
+                        goto copy;
+                if (PageHuge(page) || PageTransHuge(page))
+                        goto copy;
+                if (page_mapped(page))
+                        goto copy;
+                useraddr = (unsigned long)sd->u.userptr;
+                mm = current->mm;
+
+		ret = -EAGAIN;
+		down_read(&mm->mmap_sem);
+		vma = find_vma_intersection(mm, useraddr, useraddr + PAGE_SIZE);
+		if (IS_ERR_OR_NULL(vma))
+			goto up_copy;
+		if (!vma->anon_vma) {
+			ret = anon_vma_prepare(vma);
+			if (ret)
+				goto up_copy;
+		}
+		zap_page_range(vma, useraddr, PAGE_SIZE, NULL);
+		ret = lock_page_killable(page);
+		if (ret)
+			goto up_copy;
+		ptep = get_locked_pte(mm, useraddr, &ptl);
+		if (!ptep)
+			goto unlock_up_copy;
+		pte = *ptep;
+		if (pte_present(pte))
+			goto unlock_up_copy;
+		get_page(page);
+		page_add_anon_rmap(page, vma, useraddr);
+		pte = mk_pte(page, vma->vm_page_prot);
+		set_pte_at(mm, useraddr, ptep, pte);
+		update_mmu_cache(vma, useraddr, ptep);
+		pte_unmap_unlock(ptep, ptl);
+		ret = 0;
+unlock_up_copy:
+		unlock_page(page);
+up_copy:
+		up_read(&mm->mmap_sem);
+		if (!ret) {
+			ret = sd->len;
+			goto out;
+		}
+		/* else ret < 0 and we should fallback to copying */
+		VM_BUG_ON(ret > 0);
+	}
+copy:
 	/*
 	 * See if we can use the atomic maps, by prefaulting in the
 	 * pages and doing an atomic copy
