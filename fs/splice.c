@@ -188,12 +188,17 @@ ssize_t splice_to_pipe(struct pipe_inode_info *pipe,
 {
 	unsigned int spd_pages = spd->nr_pages;
 	int ret, do_wakeup, page_nr;
+	struct vm_area_struct *vma;
+	unsigned long user_start, user_end;
 
 	ret = 0;
 	do_wakeup = 0;
 	page_nr = 0;
+	vma = NULL;
+	user_start = user_end = 0;
 
 	pipe_lock(pipe);
+	down_read(&current->mm->mmap_sem);
 
 	for (;;) {
 		if (!pipe->readers) {
@@ -212,8 +217,44 @@ ssize_t splice_to_pipe(struct pipe_inode_info *pipe,
 			buf->len = spd->partial[page_nr].len;
 			buf->private = spd->partial[page_nr].private;
 			buf->ops = spd->ops;
-			if (spd->flags & SPLICE_F_GIFT)
+			if (spd->flags & SPLICE_F_GIFT) {
+				unsigned long useraddr =
+						spd->partial[page_nr].useraddr;
+
+				if ((spd->flags & SPLICE_F_MOVE) &&
+						!buf->offset &&
+						(buf->len == PAGE_SIZE)) {
+					/* Can move page aligned buf, gather
+					 * requests to make a single
+					 * zap_page_range() call per VMA
+					 */
+					if (vma && (useraddr == user_end) &&
+						   ((useraddr + PAGE_SIZE) <=
+						    vma->vm_end)) {
+						/* same vma, no holes */
+						user_end += PAGE_SIZE;
+					} else {
+						if (vma)
+							zap_page_range(vma,
+								user_start,
+								(user_end -
+								 user_start),
+								NULL);
+						vma = find_vma_intersection(
+								current->mm,
+								useraddr,
+								(useraddr +
+								 PAGE_SIZE));
+						if (!IS_ERR_OR_NULL(vma)) {
+							user_start = useraddr;
+							user_end = (useraddr +
+								    PAGE_SIZE);
+						} else
+							vma = NULL;
+					}
+				}
 				buf->flags |= PIPE_BUF_FLAG_GIFT;
+			}
 
 			pipe->nrbufs++;
 			page_nr++;
@@ -255,6 +296,10 @@ ssize_t splice_to_pipe(struct pipe_inode_info *pipe,
 		pipe->waiting_writers--;
 	}
 
+	if (vma)
+		zap_page_range(vma, user_start, (user_end - user_start), NULL);
+
+	up_read(&current->mm->mmap_sem);
 	pipe_unlock(pipe);
 
 	if (do_wakeup)
@@ -485,6 +530,7 @@ fill_it:
 
 		spd.partial[page_nr].offset = loff;
 		spd.partial[page_nr].len = this_len;
+		spd.partial[page_nr].useraddr = index << PAGE_CACHE_SHIFT;
 		len -= this_len;
 		loff = 0;
 		spd.nr_pages++;
@@ -656,6 +702,7 @@ ssize_t default_file_splice_read(struct file *in, loff_t *ppos,
 		this_len = min_t(size_t, vec[i].iov_len, res);
 		spd.partial[i].offset = 0;
 		spd.partial[i].len = this_len;
+		spd.partial[i].useraddr = (unsigned long)vec[i].iov_base;
 		if (!this_len) {
 			__free_page(spd.pages[i]);
 			spd.pages[i] = NULL;
@@ -1475,6 +1522,8 @@ static int get_iovec_page_array(const struct iovec __user *iov,
 
 			partial[buffers].offset = off;
 			partial[buffers].len = plen;
+			partial[buffers].useraddr = (unsigned long)base;
+			base = (void*)((unsigned long)base + PAGE_SIZE);
 
 			off = 0;
 			len -= plen;
